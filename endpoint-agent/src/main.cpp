@@ -16,21 +16,26 @@
 #include <boost/asio.hpp>
 
 #pragma comment(lib, "tdh.lib")
+#pragma comment(lib, "advapi32.lib")
 
 using boost::asio::ip::tcp;
 
 std::queue<std::string> telemetry_queue;
 std::mutex queue_mutex;
 
-static const GUID ProcessProviderGuid = 
-    { 0x3d6fa8d0, 0xfe05, 0x11d0, { 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c } };
+// Modern ETW Provider: Microsoft-Windows-Kernel-Process
+static const GUID KernelProcessGuid = 
+    { 0x22fb2cd6, 0x0e7b, 0x422b, { 0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16 } };
+
+// Unique Session ID for Aegis
+static const GUID SessionGuid = 
+    { 0x12345678, 0x1234, 0x1234, { 0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc } };
 
 // Callback when a kernel event is received
 VOID WINAPI ProcessEventRecord(PEVENT_RECORD pEventRecord) {
-    if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, ProcessProviderGuid) || 
-        IsEqualGUID(pEventRecord->EventHeader.ProviderId, SystemTraceControlGuid)) {
+    if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, KernelProcessGuid)) {
         
-        // Event ID 1 = Process Start
+        // Event ID 1 = Process Start in the modern provider
         if (pEventRecord->EventHeader.EventDescriptor.Id == 1) {
             ULONG bufferSize = 0;
             TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
@@ -41,30 +46,48 @@ VOID WINAPI ProcessEventRecord(PEVENT_RECORD pEventRecord) {
                     
                     DWORD pid = 0;
                     DWORD ppid = 0;
+                    std::string image_name = "unknown";
 
+                    // The modern provider uses exactly these names
                     for (USHORT i = 0; i < pInfo->PropertyCount; i++) {
                         PWSTR propertyName = reinterpret_cast<PWSTR>(reinterpret_cast<PBYTE>(pInfo) + pInfo->EventPropertyInfoArray[i].NameOffset);
-                        if (_wcsicmp(propertyName, L"ProcessId") == 0) {
-                            PROPERTY_DATA_DESCRIPTOR source = { 0 };
-                            source.PropertyName = reinterpret_cast<ULONGLONG>(propertyName);
-                            source.ArrayIndex = ULONG_MAX;
+                        PROPERTY_DATA_DESCRIPTOR source = { 0 };
+                        source.PropertyName = reinterpret_cast<ULONGLONG>(propertyName);
+                        source.ArrayIndex = ULONG_MAX;
+
+                        if (_wcsicmp(propertyName, L"ProcessID") == 0) {
                             TdhGetProperty(pEventRecord, 0, NULL, 1, &source, sizeof(DWORD), reinterpret_cast<PBYTE>(&pid));
                         }
-                        if (_wcsicmp(propertyName, L"ParentProcessId") == 0) {
-                            PROPERTY_DATA_DESCRIPTOR source = { 0 };
-                            source.PropertyName = reinterpret_cast<ULONGLONG>(propertyName);
-                            source.ArrayIndex = ULONG_MAX;
+                        else if (_wcsicmp(propertyName, L"ParentProcessID") == 0) {
                             TdhGetProperty(pEventRecord, 0, NULL, 1, &source, sizeof(DWORD), reinterpret_cast<PBYTE>(&ppid));
                         }
+                        else if (_wcsicmp(propertyName, L"ImageName") == 0) {
+                            ULONG propSize = 0;
+                            if (TdhGetPropertySize(pEventRecord, 0, NULL, 1, &source, &propSize) == ERROR_SUCCESS && propSize > 0) {
+                                std::vector<BYTE> imgBuf(propSize);
+                                if (TdhGetProperty(pEventRecord, 0, NULL, 1, &source, propSize, imgBuf.data()) == ERROR_SUCCESS) {
+                                    image_name = std::string(reinterpret_cast<char*>(imgBuf.data()), propSize);
+                                    while (!image_name.empty() && image_name.back() == '\0') {
+                                        image_name.pop_back();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    std::string escaped_image = "";
+                    for (char c : image_name) {
+                        if (c == '\\') escaped_image += "\\\\";
+                        else if (c != '\0') escaped_image += c;
                     }
 
                     std::string payload = "{\"event_type\": \"PROCESS_START\", \"pid\": " + 
                                           std::to_string(pid) + ", \"ppid\": " + 
-                                          std::to_string(ppid) + ", \"image\": \"C:\\Windows\\System32\\cmd.exe\"}";
+                                          std::to_string(ppid) + ", \"image\": \"" + escaped_image + "\"}";
 
                     std::lock_guard<std::mutex> lock(queue_mutex);
                     telemetry_queue.push(payload);
-                    std::cout << "[Native ETW] Process Started: PID " << pid << ", PPID " << ppid << "\n";
+                    std::cout << "[Native ETW] Process Started: PID " << pid << " -> " << escaped_image << "\n";
                 }
             }
         }
@@ -76,33 +99,37 @@ void etw_collector_thread() {
     std::vector<BYTE> propBuffer(bufferSize, 0);
     PEVENT_TRACE_PROPERTIES pTraceProperties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(propBuffer.data());
     
-    // 1. Stop any ghost sessions before starting (prevents Error 183)
+    // Stop old ghost sessions
     pTraceProperties->Wnode.BufferSize = bufferSize;
-    pTraceProperties->Wnode.Guid = SystemTraceControlGuid;
+    pTraceProperties->Wnode.Guid = SessionGuid;
     pTraceProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    ControlTraceW(0, KERNEL_LOGGER_NAMEW, pTraceProperties, EVENT_TRACE_CONTROL_STOP);
+    ControlTraceW(0, L"AegisModernSession", pTraceProperties, EVENT_TRACE_CONTROL_STOP);
 
-    // 2. Re-initialize properties for a fresh trace
+    // Initialize modern session
     ZeroMemory(propBuffer.data(), bufferSize);
     pTraceProperties->Wnode.BufferSize = bufferSize;
     pTraceProperties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     pTraceProperties->Wnode.ClientContext = 1;
-    pTraceProperties->Wnode.Guid = SystemTraceControlGuid;
-    pTraceProperties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE; // REQUIRED for Error 87
-    pTraceProperties->EnableFlags = EVENT_TRACE_FLAG_PROCESS;
+    pTraceProperties->Wnode.Guid = SessionGuid;
+    pTraceProperties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
     pTraceProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
 
-    // 3. Start Trace (MUST use KERNEL_LOGGER_NAMEW)
     TRACEHANDLE sessionHandle = 0;
-    ULONG status = StartTraceW(&sessionHandle, KERNEL_LOGGER_NAMEW, pTraceProperties);
+    ULONG status = StartTraceW(&sessionHandle, L"AegisModernSession", pTraceProperties);
     if (status != ERROR_SUCCESS && status != ERROR_ALREADY_EXISTS) {
-        std::cerr << "[ETW Error] StartTrace failed with error: " << status << " (Run as Administrator!)\n";
+        std::cerr << "[ETW Error] StartTrace failed: " << status << "\n";
         return;
     }
 
-    // 4. Open Real-Time Trace
+    // Enable the specific modern provider
+    status = EnableTraceEx2(sessionHandle, &KernelProcessGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW Error] EnableTraceEx2 failed: " << status << "\n";
+        return;
+    }
+
     EVENT_TRACE_LOGFILEW traceLog = { 0 };
-    traceLog.LoggerName = const_cast<LPWSTR>(KERNEL_LOGGER_NAMEW);
+    traceLog.LoggerName = const_cast<LPWSTR>(L"AegisModernSession");
     traceLog.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     traceLog.EventRecordCallback = (PEVENT_RECORD_CALLBACK)ProcessEventRecord;
 
@@ -112,7 +139,7 @@ void etw_collector_thread() {
         return;
     }
 
-    std::cout << "[ETW Thread] Native kernel process tracing active.\n";
+    std::cout << "[ETW Thread] Native kernel process tracing active (Modern).\n";
     ProcessTrace(&traceHandle, 1, NULL, NULL);
     CloseTrace(traceHandle);
 }
@@ -184,7 +211,7 @@ void network_worker(const std::string& host, const std::string& port, const std:
 
 int main() {
     std::string agent_id = "aegis-win-001";
-    std::cout << "Starting Aegis Endpoint Agent (Native ETW) [" << agent_id << "]...\n";
+    std::cout << "Starting Aegis Endpoint Agent (Modern ETW) [" << agent_id << "]...\n";
 
     std::thread etw_thread(etw_collector_thread);
     etw_thread.detach();
