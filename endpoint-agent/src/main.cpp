@@ -23,19 +23,14 @@ using boost::asio::ip::tcp;
 std::queue<std::string> telemetry_queue;
 std::mutex queue_mutex;
 
-// Modern ETW Provider: Microsoft-Windows-Kernel-Process
 static const GUID KernelProcessGuid = 
     { 0x22fb2cd6, 0x0e7b, 0x422b, { 0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16 } };
 
-// Unique Session ID for Aegis
 static const GUID SessionGuid = 
     { 0x12345678, 0x1234, 0x1234, { 0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc } };
 
-// Callback when a kernel event is received
 VOID WINAPI ProcessEventRecord(PEVENT_RECORD pEventRecord) {
     if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, KernelProcessGuid)) {
-        
-        // Event ID 1 = Process Start in the modern provider
         if (pEventRecord->EventHeader.EventDescriptor.Id == 1) {
             ULONG bufferSize = 0;
             TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
@@ -48,7 +43,6 @@ VOID WINAPI ProcessEventRecord(PEVENT_RECORD pEventRecord) {
                     DWORD ppid = 0;
                     std::string image_name = "unknown";
 
-                    // The modern provider uses exactly these names
                     for (USHORT i = 0; i < pInfo->PropertyCount; i++) {
                         PWSTR propertyName = reinterpret_cast<PWSTR>(reinterpret_cast<PBYTE>(pInfo) + pInfo->EventPropertyInfoArray[i].NameOffset);
                         PROPERTY_DATA_DESCRIPTOR source = { 0 };
@@ -99,13 +93,11 @@ void etw_collector_thread() {
     std::vector<BYTE> propBuffer(bufferSize, 0);
     PEVENT_TRACE_PROPERTIES pTraceProperties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(propBuffer.data());
     
-    // Stop old ghost sessions
     pTraceProperties->Wnode.BufferSize = bufferSize;
     pTraceProperties->Wnode.Guid = SessionGuid;
     pTraceProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     ControlTraceW(0, L"AegisModernSession", pTraceProperties, EVENT_TRACE_CONTROL_STOP);
 
-    // Initialize modern session
     ZeroMemory(propBuffer.data(), bufferSize);
     pTraceProperties->Wnode.BufferSize = bufferSize;
     pTraceProperties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
@@ -121,7 +113,6 @@ void etw_collector_thread() {
         return;
     }
 
-    // Enable the specific modern provider
     status = EnableTraceEx2(sessionHandle, &KernelProcessGuid, EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
     if (status != ERROR_SUCCESS) {
         std::cerr << "[ETW Error] EnableTraceEx2 failed: " << status << "\n";
@@ -183,8 +174,10 @@ void network_worker(const std::string& host, const std::string& port, const std:
 
                 if (!payload.empty()) {
                     std::string frame;
-                    frame.push_back(0x81); 
+                    frame.push_back(0x81); // FIN + Text frame
                     size_t length = payload.size();
+                    
+                    // WebSocket Client MUST mask frames (Bit 7 set to 1 -> 0x80)
                     if (length <= 125) {
                         frame.push_back(static_cast<char>(length | 0x80));
                     } else {
@@ -193,13 +186,22 @@ void network_worker(const std::string& host, const std::string& port, const std:
                         frame.push_back(static_cast<char>(length & 0xFF));
                     }
 
-                    frame.append(4, 0x00);
-                    frame.append(payload);
+                    // 4-byte Masking Key (Required by RFC 6455)
+                    char mask[4] = { 0x12, 0x34, 0x56, 0x78 };
+                    frame.append(mask, 4);
+
+                    // XOR the payload with the mask
+                    std::string masked_payload = payload;
+                    for (size_t i = 0; i < length; ++i) {
+                        masked_payload[i] ^= mask[i % 4];
+                    }
+
+                    frame.append(masked_payload);
 
                     boost::asio::write(socket, boost::asio::buffer(frame));
                     std::cout << "[Network Thread] Telemetry transmitted.\n";
                 } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
         } catch (const std::exception& e) {
