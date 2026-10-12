@@ -1,13 +1,11 @@
-cmake_minimum_required(VERSION 3.20)
-project(aegis_agent CXX)
+cmake_minimum_required(VERSION 3.10)
+project(aegis_agent)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
 
 find_package(Boost REQUIRED COMPONENTS system thread)
-find_package(Threads REQUIRED)
-
-include_directories(include ${Boost_INCLUDE_DIRS})
+find_package(krabsetw CONFIG REQUIRED)
 
 add_executable(aegis_agent src/main.cpp)
-target_link_libraries(aegis_agent ${Boost_LIBRARIES} Threads::Threads)
+
+target_link_libraries(aegis_agent PRIVATE Boost::boost Boost::system Boost::thread krabsetw::krabsetw)
