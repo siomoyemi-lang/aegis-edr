@@ -1,77 +1,116 @@
 #include <iostream>
+#include <string>
 #include <thread>
 #include <chrono>
-#include <atomic>
-#include <string>
+#include <mutex>
+#include <queue>
 #include <boost/asio.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-#include "concurrentqueue.h"
+#include <krabs.hpp>
 
-namespace net = boost::asio;
-namespace websocket = boost::beast::websocket;
-using tcp = boost::asio::ip::tcp;
+using boost::asio::ip::tcp;
 
-// Global lock-free queue for raw JSON telemetry strings
-moodycamel::ConcurrentQueue<std::string> g_telemetry_queue;
-std::atomic<bool> g_running{true};
+// Thread-safe telemetry queue
+std::queue<std::string> telemetry_queue;
+std::mutex queue_mutex;
 
-// Dummy Event Collection Thread (Simulating OS callbacks)
-void mock_event_collector(const std::string& agent_id) {
-    uint64_t pid_counter = 4000;
-    
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        
-        // Formatted per Aegis standardized telemetry schema
-        std::string mock_json = "{"
-            "\"event_type\": \"process_creation\","
-            "\"timestamp\": " + std::to_string(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())) + ","
-            "\"agent_id\": \"" + agent_id + "\","
-            "\"payload\": {"
-                "\"pid\": " + std::to_string(pid_counter++) + ","
-                "\"ppid\": 1052,"
-                "\"image_path\": \"C:\\\\Windows\\\\System32\\\\cmd.exe\","
-                "\"command_line\": \"cmd.exe /c whoami\","
-                "\"user\": \"NT AUTHORITY\\\\SYSTEM\","
-                "\"hash_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""
-            "}"
-        "}";
+// ETW Event Callback for Process Creation
+void on_process_start(const EVENT_RECORD &record, const krabs::schema &schema) {
+    try {
+        if (schema.event_id() == 1) { // Process Start
+            std::wstring image_path = schema.parse<std::wstring>(L"ImageFileName");
+            uint32_t process_id = schema.parse<uint32_t>(L"ProcessId");
+            uint32_t parent_pid = schema.parse<uint32_t>(L"ParentProcessId");
 
-        g_telemetry_queue.enqueue(mock_json);
-        std::cout << "[Collection Thread] Mock event queued." << std::endl;
+            std::string path_str(image_path.begin(), image_path.end());
+
+            std::string payload = "{\"event_type\": \"PROCESS_START\", \"pid\": " + 
+                                  std::to_string(process_id) + ", \"ppid\": " + 
+                                  std::to_string(parent_pid) + ", \"image\": \"" + path_str + "\"}";
+
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            telemetry_queue.push(payload);
+            std::cout << "[ETW] Process Started: PID " << process_id << " -> " << path_str << "\n";
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "[ETW Parse Error] " << e.what() << "\n";
     }
 }
 
-// Networking Thread consuming queue and transmitting via WebSocket
+void etw_collector_thread() {
+    try {
+        krabs::kernel_trace trace(L"AegisETWSession");
+        krabs::provider<> process_provider(L"Microsoft-Windows-Kernel-Process");
+        
+        process_provider.add_on_event_callback(on_process_start);
+        trace.enable(process_provider);
+        
+        std::cout << "[ETW Thread] Kernel process tracing active.\n";
+        trace.start();
+    } catch (const std::exception &e) {
+        std::cerr << "[ETW Error] " << e.what() << " (Make sure you are running as Administrator!)\n";
+    }
+}
+
 void network_worker(const std::string& host, const std::string& port, const std::string& agent_id) {
-    while (g_running) {
+    boost::asio::io_context ioc;
+    tcp::resolver resolver(ioc);
+
+    while (true) {
         try {
-            net::io_context ioc;
-            tcp::resolver resolver(ioc);
-            websocket::stream<tcp::socket> ws(ioc);
+            tcp::resolver::results_type endpoints = resolver.resolve(host, port);
+            tcp::socket socket(ioc);
+            boost::asio::connect(socket, endpoints);
 
-            auto const results = resolver.resolve(host, port);
-            net::connect(ws.next_layer(), results.begin(), results.end());
+            std::string path = "/ws/telemetry/" + agent_id;
+            
+            boost::asio::streambuf request;
+            std::ostream request_stream(&request);
+            request_stream << "GET " << path << " HTTP/1.1\r\n"
+                           << "Host: " << host << ":" << port << "\r\n"
+                           << "Upgrade: websocket\r\n"
+                           << "Connection: Upgrade\r\n"
+                           << "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                           << "Sec-WebSocket-Version: 13\r\n\r\n";
 
-            std::string target = "/ws/telemetry/" + agent_id;
-            ws.handshake(host + ":" + port, target);
-            std::cout << "[Network Thread] Connected to API Gateway at " << target << std::endl;
+            boost::asio::write(socket, request);
 
-            std::string payload;
-            while (g_running) {
-                if (g_telemetry_queue.try_dequeue(payload)) {
-                    ws.write(net::buffer(payload));
-                    std::cout << "[Network Thread] Telemetry transmitted." << std::endl;
+            boost::asio::streambuf response;
+            boost::asio::read_until(socket, response, "\r\n\r\n");
+            std::cout << "[Network Thread] Connected to API Gateway at " << path << "\n";
+
+            while (true) {
+                std::string payload;
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    if (!telemetry_queue.empty()) {
+                        payload = telemetry_queue.front();
+                        telemetry_queue.pop();
+                    }
+                }
+
+                if (!payload.empty()) {
+                    std::string frame;
+                    frame.push_back(0x81); // FIN + Text frame
+                    size_t length = payload.size();
+                    if (length <= 125) {
+                        frame.push_back(static_cast<char>(length | 0x80));
+                    } else {
+                        frame.push_back(static_cast<char>(126 | 0x80));
+                        frame.push_back(static_cast<char>((length >> 8) & 0xFF));
+                        frame.push_back(static_cast<char>(length & 0xFF));
+                    }
+
+                    frame.append(4, 0x00);
+                    frame.append(payload);
+
+                    boost::asio::write(socket, boost::asio::buffer(frame));
+                    std::cout << "[Network Thread] Telemetry transmitted.\n";
                 } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
             }
-
-            ws.close(websocket::close_code::normal);
-        }
-        catch (const std::exception& e) {
-            std::cerr << "[Network Thread] Connection error: " << e.what() << ". Retrying in 5 seconds..." << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Network Thread] Connection error: " << e.what() << ". Retrying in 5 seconds...\n";
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
@@ -79,16 +118,13 @@ void network_worker(const std::string& host, const std::string& port, const std:
 
 int main() {
     std::string agent_id = "aegis-win-001";
-    std::string host = "127.0.0.1";
-    std::string port = "8000";
+    std::cout << "Starting Aegis Endpoint Agent (ETW Enabled) [" << agent_id << "]...\n";
 
-    std::cout << "Starting Aegis Endpoint Agent [" << agent_id << "]..." << std::endl;
+    std::thread etw_thread(etw_collector_thread);
+    etw_thread.detach();
 
-    std::thread collector(mock_event_collector, agent_id);
-    std::thread network(network_worker, host, port, agent_id);
-
-    collector.join();
-    network.join();
+    std::thread net_thread(network_worker, "127.0.0.1", "8000", agent_id);
+    net_thread.join();
 
     return 0;
 }
