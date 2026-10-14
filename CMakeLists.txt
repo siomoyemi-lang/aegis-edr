@@ -1,2 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
+project(aegis LANGUAGES CXX)
 
-target_compile_definitions(aegis_agent PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
+# Top-level entry point so `cmake -B build && cmake --build build --config Release` works from the repo root.
+add_subdirectory(endpoint-agent)

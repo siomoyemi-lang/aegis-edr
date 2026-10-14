@@ -1,0 +1,78 @@
+[
+  {
+    "rule_id": "AEG-WIN-001",
+    "name": "Credential Dumping Tool (mimikatz)",
+    "severity": "CRITICAL",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "mimikatz.exe"}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-002",
+    "name": "Netcat Execution",
+    "severity": "HIGH",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "nc.exe"}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-003",
+    "name": "PowerShell Execution",
+    "severity": "HIGH",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "in", "value": ["powershell.exe", "pwsh.exe"]}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-004",
+    "name": "Command Prompt Execution",
+    "severity": "LOW",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "cmd.exe"}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-005",
+    "name": "Web Shell Reverse Connection",
+    "severity": "CRITICAL",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "cmd.exe"},
+      {"field": "parent_image_name", "operator": "in", "value": ["nginx.exe", "w3wp.exe", "httpd.exe"]}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-006",
+    "name": "Base64 Obfuscated PowerShell",
+    "severity": "HIGH",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "in", "value": ["powershell.exe", "pwsh.exe"]},
+      {"field": "command_line", "operator": "contains_any", "value": ["-enc", "-EncodedCommand"]}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-007",
+    "name": "Shadow Copy Deletion (Ransomware Precursor)",
+    "severity": "CRITICAL",
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "vssadmin.exe"},
+      {"field": "command_line", "operator": "contains", "value": "delete shadows"}
+    ]
+  },
+  {
+    "rule_id": "AEG-WIN-008",
+    "name": "Reconnaissance (whoami)",
+    "severity": "LOW",
+    "enabled": false,
+    "condition": "AND",
+    "criteria": [
+      {"field": "image_name", "operator": "equals", "value": "whoami.exe"}
+    ]
+  }
+]

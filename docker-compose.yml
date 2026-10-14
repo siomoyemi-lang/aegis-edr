@@ -1,18 +1,25 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7.2-alpine
     ports:
       - "6379:6379"
     command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
 
   api-gateway:
-    build: 
+    build:
       context: ./api-gateway
     ports:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      # Set a shared secret to protect the kill endpoint (also pass it to the engine and the console); AEGIS_AGENT_TOKEN authenticates agents:
+      - AEGIS_API_KEY=${AEGIS_API_KEY:-}
+      - AEGIS_AGENT_TOKEN=${AEGIS_AGENT_TOKEN:-}
+      - AEGIS_CORS_ORIGINS=${AEGIS_CORS_ORIGINS:-http://localhost:3000}
     depends_on:
       - redis
+
+volumes:
+  redis-data:
