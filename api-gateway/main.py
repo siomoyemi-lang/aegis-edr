@@ -1,62 +1,64 @@
+import asyncio
 import json
-import redis
-import sys
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis
+from pydantic import BaseModel
 
-try:
-    # Connect to the local Redis container
-    r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-    r.ping()
-except redis.ConnectionError:
-    print("[-] Fatal: Could not connect to Redis. Ensure the Docker container is running.")
-    sys.exit(1)
+app = FastAPI()
 
-print("Starting Aegis Detection Engine...")
-print("Listening for real-time endpoint telemetry on Redis Stream...")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-SUSPICIOUS_BINARIES = ['cmd.exe', 'powershell.exe', 'mimikatz.exe', 'nc.exe']
+# Agent WebSocket connection manager
+agent_manager = {}
 
-# '$' tells Redis to only read NEW messages that arrive after we connect
-last_id = '$'
+async def get_redis():
+    return Redis(host="redis", port=6379, db=0)
 
-try:
-    while True:
-        # Block for up to 1000ms waiting for a new message
-        # This allows Ctrl+C to interrupt the loop cleanly every 1 second
-        messages = r.xread({'stream:aegis_telemetry': last_id}, count=10, block=1000)
-        
-        if messages:
-            for stream_name, stream_messages in messages:
-                for message_id, message_data in stream_messages:
-                    # Update last_id to move forward in the stream
-                    last_id = message_id
-                    
-                    try:
-                        # The gateway stores the JSON string inside the 'raw_data' key
-                        raw_data = message_data.get('raw_data')
-                        if not raw_data:
-                            continue
-                            
-                        payload = json.loads(raw_data)
-                        
-                        if payload.get("event_type") == "PROCESS_START":
-                            image_path = payload.get("image", "").lower()
-                            pid = payload.get("pid")
-                            agent_id = message_data.get("agent_id", "unknown")
-                            
-                            is_suspicious = any(susp in image_path for susp in SUSPICIOUS_BINARIES)
-                            
-                            if is_suspicious:
-                                print(f"\n[!!!] THREAT DETECTED: Suspicious process spawned!")
-                                print(f"      -> Agent: {agent_id}")
-                                print(f"      -> Image: {payload.get('image')}")
-                                print(f"      -> PID:   {pid}")
-                            else:
-                                exe_name = image_path.split('\\')[-1]
-                                print(f"[*] Process Logged: {exe_name} (PID: {pid})")
+class KillCommand(BaseModel):
+    pid: int
 
-                    except json.JSONDecodeError:
-                        print(f"[DEBUG] Malformed JSON received: {message_data}")
+@app.websocket("/ws/telemetry/{agent_id}")
+async def telemetry_endpoint(websocket: WebSocket, agent_id: str, redis: Redis = Depends(get_redis)):
+    await websocket.accept()
+    agent_manager[agent_id] = websocket
+    print(f"Agent {agent_id} connected.")
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await redis.xadd("stream:aegis_telemetry", {"agent_id": agent_id, "raw_data": data})
+    except WebSocketDisconnect:
+        if agent_id in agent_manager:
+            del agent_manager[agent_id]
+        print(f"Agent {agent_id} disconnected.")
 
-except KeyboardInterrupt:
-    print("\nShutting down Detection Engine cleanly...")
-    sys.exit(0)
+@app.post("/api/agents/{agent_id}/kill")
+async def kill_process(agent_id: str, command: KillCommand):
+    if agent_id in agent_manager:
+        ws = agent_manager[agent_id]
+        await ws.send_text(json.dumps({"action": "KILL_PID", "target": command.pid}))
+        return {"status": "Kill signal dispatched"}
+    return {"error": "Agent not connected"}
+
+# Frontend Dashboard WebSocket Endpoint
+@app.websocket("/ws/frontend")
+async def frontend_endpoint(websocket: WebSocket, redis: Redis = Depends(get_redis)):
+    await websocket.accept()
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("channel:alerts")
+    
+    try:
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message and message["type"] == "message":
+                await websocket.send_text(message["data"].decode("utf-8"))
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        await pubsub.unsubscribe("channel:alerts")
